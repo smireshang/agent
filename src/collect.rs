@@ -3,6 +3,8 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::net::{IpAddr, Ipv6Addr};
+use std::path::Path;
 use std::time::Instant;
 
 use serde::Serialize;
@@ -12,13 +14,22 @@ use serde::Serialize;
 /// a second time inside their carrier.
 ///
 /// `tailscale` belongs to the tunnel group for the same reason `wg` does: it is
-/// WireGuard under another name, on an interface not called `wg0`.
+/// WireGuard under another name, on an interface not called `wg0`. `fwln` is
+/// the half of a Proxmox firewall's veth pair that `fwpr` does not match, and
+/// `ifb` mirrors another interface's ingress for traffic shaping.
 ///
-/// ponytail: a name list, so the next tunnel will be missed as well. The kernel
-/// knows the answer -- a real NIC has /sys/class/net/<name>/device, a virtual
-/// one does not -- but a card wrongly failing that test loses a node's entire
-/// traffic, where a missing name only doubles it. Worth the swap only after
-/// verification against every card in the fleet.
+/// `gretap` and `erspan` are GRE carrying Ethernet; the kernel creates one of
+/// each, idle, wherever the GRE module is loaded. `lxc` and `cilium` are
+/// Cilium's pod veths and host devices, one veth per pod.
+///
+/// ponytail: a name list, so a GRE tap, or a tap or veth that is no bridge's
+/// port, under a new name will be missed. Nothing in the kernel separates one
+/// from a container's only link -- an LXC guest's veth, the tap of a rootless
+/// container's pasta network -- and a guest counted as virtual would report no
+/// traffic at all. Bridge ports and other tunnels are recognised by
+/// [`counted_elsewhere`] whatever their name; the entries here also keep their
+/// addresses out of [`addresses`], see [`lends_address`]. `--iface` covers
+/// whatever neither catches.
 const SKIP_IFACES: &[&str] = &[
     "lo",
     "docker",
@@ -34,9 +45,15 @@ const SKIP_IFACES: &[&str] = &[
     "podman",
     "fwbr",
     "fwpr",
+    "fwln",
+    "ifb",
+    "gretap",
+    "erspan",
     "kube",
     "cali",
     "nerdctl",
+    "lxc",
+    "cilium",
     "zt",
 ];
 
@@ -65,6 +82,7 @@ const SKIP_FSTYPES: &[&str] = &[
     "efivarfs",
     "nsfs",
     "overlay",
+    "ecryptfs",
     "fuse",
     "rpc_pipefs",
     // Remote storage. `//server/share` passes the device check that excludes
@@ -80,7 +98,7 @@ const SKIP_FSTYPES: &[&str] = &[
     "9p",
 ];
 
-#[derive(Serialize, Debug, Clone, PartialEq)]
+#[derive(Serialize)]
 pub struct Facts {
     pub hostname: String,
     pub os: String,
@@ -93,17 +111,25 @@ pub struct Facts {
     pub swap_total: u64,
     pub disk_total: u64,
     pub agent_version: String,
-    /// The host's own addresses. The hub sees only the family the agent
-    /// connected over, which on a dual-stack host is usually v6.
+    /// The host's own addresses, public ones first; see [`pick`]. The hub sees
+    /// only the family the agent connected over.
     pub ipv4: String,
     pub ipv6: String,
 }
 
-#[derive(Serialize, Debug, Clone, Default, PartialEq)]
+#[derive(Serialize)]
 pub struct Metrics {
-    /// Identifies this boot. It changes on reboot, which is how the hub knows
-    /// the kernel's byte counters restarted at zero.
+    /// Names the span over which `net_rx_total` and `net_tx_total` readings
+    /// are comparable. The hub only tests it for equality, and a change makes
+    /// it re-baseline rather than book the difference. It is the kernel's boot
+    /// id, which changes when the counters restart at zero, then `/` and a
+    /// digest of the interfaces summed: an interface joining the sum within one
+    /// boot -- a reclassified device, a changed `--iface` -- would otherwise
+    /// have its lifetime bytes booked as traffic.
     pub boot_id: String,
+    /// The `--iface` this agent runs with, empty for the default rules. Shown
+    /// by the panel, which reinstalls with it.
+    pub iface: String,
     pub uptime: u64,
     pub cpu: f32,
     pub load: [f32; 3],
@@ -113,8 +139,9 @@ pub struct Metrics {
     pub swap_used: u64,
     pub disk_total: u64,
     pub disk_used: u64,
-    /// Kernel lifetime byte counters. The hub accumulates these; the agent
-    /// stores nothing and does not attempt to survive a reboot.
+    /// The counted interfaces' lifetime byte counters, summed. The hub
+    /// accumulates these; the agent stores nothing and does not attempt to
+    /// survive a reboot.
     pub net_rx_total: u64,
     pub net_tx_total: u64,
     pub net_rx: u64,
@@ -124,15 +151,101 @@ pub struct Metrics {
     pub procs: u32,
 }
 
+/// The traffic filter set by `--iface`: full interface names separated by
+/// commas.
+///
+/// A plain entry makes the list the whole answer: nothing unlisted is counted.
+/// Only the machine's owner knows which port faces the provider on a router,
+/// where a forwarded byte crosses two real NICs, or whether a Proxmox host's
+/// `vmbr0` alone should count. A listed name is counted whatever the built-in
+/// rules say, since that is how `vmbr0` or `pppoe-wan` is chosen. An entry
+/// starting with `-` removes that interface from what is counted otherwise,
+/// which one batch command can apply across machines whose other NICs are named
+/// differently. Exclusions win over inclusions.
+#[derive(Default)]
+pub struct Ifaces {
+    spec: String,
+    only: Vec<String>,
+    skip: Vec<String>,
+}
+
+impl Ifaces {
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        let entries: Vec<&str> = spec.split(',').map(str::trim).filter(|e| !e.is_empty()).collect();
+        let mut ifaces = Self { spec: entries.join(","), ..Self::default() };
+        for entry in entries {
+            let (list, name) = match entry.strip_prefix('-') {
+                Some(name) => (&mut ifaces.skip, name),
+                None => (&mut ifaces.only, entry),
+            };
+            // Rejected rather than left to match nothing or everything: each
+            // would silently change the totals. install.sh and the panel refuse
+            // the same entries.
+            if name.is_empty() || name.starts_with('-') || name.contains(char::is_whitespace) {
+                return Err(format!(
+                    "--iface: {entry:?} is not an interface name; give full names separated by commas"
+                ));
+            }
+            list.push(name.to_owned());
+        }
+        Ok(ifaces)
+    }
+
+    fn counts(&self, sys: &Path, name: &str) -> bool {
+        if self.skip.iter().any(|n| n == name) {
+            return false;
+        }
+        if !self.only.is_empty() {
+            return self.only.iter().any(|n| n == name);
+        }
+        !skip_iface(name) && !is_stacked(name) && !counted_elsewhere(sys, name)
+    }
+}
+
+/// See [`Metrics::boot_id`]. The names are sorted, since /proc/net/dev lists a
+/// recreated interface in a new position without the set having changed, and
+/// hashed with FNV-1a, whose output no Rust release can alter.
+///
+/// ponytail: every change of the set costs the hub one interval on every
+/// interface, including a freshly created one, whose counter starts at zero and
+/// would have added correctly. Where counted interfaces come and go -- pods under
+/// names no rule knows, pppN on a VPN server -- each event loses one interval.
+/// Per-interface counters in the report, summed by the hub, would remove the
+/// loss; an offset kept here would not, as it dies with the process and takes the
+/// traffic of the downtime with it.
+fn epoch<'a>(boot_id: &str, names: impl Iterator<Item = &'a str>) -> String {
+    let mut names: Vec<&str> = names.collect();
+    names.sort_unstable();
+    // A newline cannot occur in an interface name, so no two sets join alike.
+    let digest = names
+        .join("\n")
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
+    format!("{boot_id}/{digest:016x}")
+}
+
 #[derive(Default)]
 pub struct Collector {
+    ifaces: Ifaces,
     prev_cpu: Option<(u64, u64)>,
-    prev_net: Option<(Instant, u64, u64)>,
+    /// When the last sample was taken, and each counted interface's counters.
+    prev_net_at: Option<Instant>,
+    prev_net: HashMap<String, (u64, u64)>,
 }
 
 impl Collector {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(ifaces: Ifaces) -> Self {
+        Self { ifaces, ..Self::default() }
+    }
+
+    /// The interfaces the traffic totals include at this moment.
+    pub fn counted_ifaces(&self) -> Vec<String> {
+        let dev = fs::read_to_string("/proc/net/dev").unwrap_or_default();
+        self.counted(&dev).into_iter().map(|(name, ..)| name.to_owned()).collect()
+    }
+
+    fn counted<'a>(&self, dev: &'a str) -> Vec<(&'a str, u64, u64)> {
+        net_dev(dev).filter(|(name, ..)| self.ifaces.counts(Path::new(SYS_NET), name)).collect()
     }
 
     pub fn facts(&self) -> Facts {
@@ -162,12 +275,19 @@ impl Collector {
         let (mem_total, mem_used) = mem_used(&mem);
         let (swap_total, swap_used) = swap_used(&mem);
         let (disk_total, disk_used) = disk_usage(&real_mount_points());
-        let (rx_total, tx_total) = net_totals();
-        let (rx, tx) = self.net_rate(rx_total, tx_total, Instant::now());
+        let dev = fs::read_to_string("/proc/net/dev").unwrap_or_default();
+        let counted = self.counted(&dev);
+        let (rx_total, tx_total) = totals(&counted);
+        let boot_id = epoch(
+            &read_trim("/proc/sys/kernel/random/boot_id").unwrap_or_default(),
+            counted.iter().map(|(name, ..)| *name),
+        );
+        let (rx, tx) = self.net_rate(&counted, Instant::now());
         let (tcp, udp) = conn_counts();
 
         Metrics {
-            boot_id: read_trim("/proc/sys/kernel/random/boot_id").unwrap_or_default(),
+            boot_id,
+            iface: self.ifaces.spec.clone(),
             uptime: uptime(),
             cpu: self.cpu_percent(),
             load: loadavg(),
@@ -198,29 +318,36 @@ impl Collector {
         pct
     }
 
-    fn net_rate(&mut self, rx: u64, tx: u64, now: Instant) -> (u64, u64) {
-        let rate = match self.prev_net {
-            Some((t, prx, ptx)) => {
+    /// Per interface, over those in both samples: one joining brings a lifetime
+    /// counter that is not this interval's traffic, and one whose counter
+    /// restarted moved backwards. Either would otherwise read as a burst in the
+    /// history. Kept in memory only.
+    fn net_rate(&mut self, counted: &[(&str, u64, u64)], now: Instant) -> (u64, u64) {
+        let rate = match self.prev_net_at {
+            Some(t) => {
                 let secs = now.saturating_duration_since(t).as_secs_f64();
+                let (rx, tx) = counted
+                    .iter()
+                    .filter_map(|(name, rx, tx)| {
+                        let (prx, ptx) = self.prev_net.get(*name)?;
+                        Some((rx.saturating_sub(*prx), tx.saturating_sub(*ptx)))
+                    })
+                    .fold((0u64, 0u64), |(a, b), (r, t)| (a.saturating_add(r), b.saturating_add(t)));
                 if secs <= 0.0 {
                     (0, 0)
                 } else {
-                    // A counter that moved backwards means a reboot or a wrap:
-                    // report no rate rather than a spurious spike.
-                    (
-                        (rx.saturating_sub(prx) as f64 / secs) as u64,
-                        (tx.saturating_sub(ptx) as f64 / secs) as u64,
-                    )
+                    ((rx as f64 / secs) as u64, (tx as f64 / secs) as u64)
                 }
             }
             None => (0, 0),
         };
-        self.prev_net = Some((now, rx, tx));
+        self.prev_net_at = Some(now);
+        self.prev_net = counted.iter().map(|(n, r, t)| ((*n).to_owned(), (*r, *t))).collect();
         rate
     }
 }
 
-fn read_trim(path: &str) -> Option<String> {
+fn read_trim(path: impl AsRef<Path>) -> Option<String> {
     fs::read_to_string(path).ok().map(|s| s.trim().to_owned())
 }
 
@@ -311,66 +438,194 @@ fn uptime() -> u64 {
         .unwrap_or(0.0) as u64
 }
 
-/// The first real address of each family the kernel reports. On a VPS these
-/// are the public ones; behind NAT the v4 is private, which is what the machine
-/// actually holds -- no external service is consulted.
+/// One address of each family the machine holds. Behind NAT the v4 is private,
+/// which is what the machine actually holds -- no external service is
+/// consulted.
 ///
-/// Filtered by [`SKIP_IFACES`] alone, so a docker bridge cannot pass for the
+/// Filtered by [`lends_address`], so a docker bridge cannot pass for the
 /// machine's address. [`is_stacked`] is not applied here: it answers whether
 /// bytes were already counted lower down, and a bridge holding the host address
 /// is both stacked and this machine.
 fn addresses() -> (String, String) {
-    let (mut v4, mut v6) = (String::new(), String::new());
-    for iface in if_addrs::get_if_addrs().unwrap_or_default() {
-        if skip_iface(&iface.name) || iface.is_link_local() || !iface.is_oper_up() {
-            continue;
-        }
-        match iface.ip() {
-            std::net::IpAddr::V4(ip) if v4.is_empty() => v4 = ip.to_string(),
-            std::net::IpAddr::V6(ip) if v6.is_empty() => v6 = ip.to_string(),
-            _ => {}
-        }
-    }
-    (v4, v6)
+    let transient = transient_v6(&fs::read_to_string("/proc/net/if_inet6").unwrap_or_default());
+    let held: Vec<IpAddr> = if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|i| lends_address(&i.name, i.ip()) && !i.is_link_local() && i.is_oper_up())
+        .map(|i| i.ip())
+        .collect();
+    pick(&held, &transient)
 }
 
-/// Sums the kernel's lifetime byte counters, one count per byte on the wire.
-fn net_totals() -> (u64, u64) {
-    parse_net_dev(&fs::read_to_string("/proc/net/dev").unwrap_or_default())
+/// Whether an address on this interface may be the machine's own. A skipped
+/// interface lends none: its addresses belong to the containers, guests or
+/// overlay behind it. WireGuard is the exception for a public v6, since a
+/// machine without IPv6 of its own gets a routed prefix through one. VPN
+/// clients' own addresses are private, CGNAT or ULA, which [`is_public`]
+/// rejects. Cloudflare WARP is the one that is not: `wgcf` puts a global
+/// 2606:4700::/32 address on the tunnel, shared by every user of the service
+/// and not reachable from outside, so that range is left out.
+fn lends_address(name: &str, ip: IpAddr) -> bool {
+    let routed = |v6: Ipv6Addr| is_public(ip) && v6.segments()[..2] != [0x2606, 0x4700];
+    !skip_iface(name) || (name.starts_with("wg") && matches!(ip, IpAddr::V6(v6) if routed(v6)))
 }
 
-fn parse_net_dev(text: &str) -> (u64, u64) {
-    let mut rx = 0u64;
-    let mut tx = 0u64;
-    for line in text.lines().skip(2) {
-        let Some((name, rest)) = line.split_once(':') else { continue };
-        let name = name.trim();
-        if skip_iface(name) || is_stacked(name) {
-            continue;
+/// A public address before any other, then a stable v6 before a transient
+/// one; ties keep the kernel's order. Taking the first address instead would
+/// report a ULA or a proxy's TUN address whenever its interface is listed
+/// ahead of the one holding the public address: an LXC guest with a ULA on
+/// eth0 and its public /128 on eth1 would report the ULA.
+fn pick(held: &[IpAddr], transient: &[Ipv6Addr]) -> (String, String) {
+    let best = |v6: bool| {
+        held.iter()
+            .filter(|ip| ip.is_ipv6() == v6)
+            .min_by_key(|ip| (!is_public(**ip), matches!(ip, IpAddr::V6(a) if transient.contains(a))))
+            .map_or_else(String::new, ToString::to_string)
+    };
+    (best(false), best(true))
+}
+
+/// IPv6 addresses held but not worth reporting: temporary (privacy extensions,
+/// replaced daily), deprecated (past their preferred lifetime, as an old
+/// prefix is after a home line redials), tentative, or failed duplicate
+/// detection. Read from /proc/net/if_inet6, whose fields are address, ifindex,
+/// prefix length, scope, flags and name; if_addrs does not expose the flags.
+fn transient_v6(text: &str) -> Vec<Ipv6Addr> {
+    // IFA_F_TEMPORARY | IFA_F_DADFAILED | IFA_F_DEPRECATED | IFA_F_TENTATIVE
+    const TRANSIENT: u8 = 0x01 | 0x08 | 0x20 | 0x40;
+    text.lines()
+        .filter_map(|line| {
+            let mut f = line.split_whitespace();
+            let addr = u128::from_str_radix(f.next()?, 16).ok()?;
+            let flags = u8::from_str_radix(f.nth(3)?, 16).ok()?;
+            (flags & TRANSIENT != 0).then(|| Ipv6Addr::from(addr))
+        })
+        .collect()
+}
+
+/// Globally routable. Excluded on the v4 side: RFC 1918, CGNAT (100.64/10),
+/// loopback, link-local, 0/8, 192.0.0/24 (where 464XLAT places its CLAT),
+/// 198.18/15 (the fake-IP range TUN-mode proxies such as Clash assign to
+/// themselves), multicast and reserved. On the v6 side only 2000::/3 counts,
+/// which leaves out ULA (fc00::/7), link-local and loopback.
+///
+/// The hub applies the same ranges to the addresses this agent reports; the two
+/// lists are to be changed together.
+pub fn is_public(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, c, _] = v4.octets();
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || a == 0
+                || a >= 224
+                || (a == 100 && b & 0xc0 == 64)
+                || (a == 192 && b == 0 && c == 0)
+                || (a == 198 && b & 0xfe == 18))
         }
-        let f: Vec<u64> = rest.split_whitespace().filter_map(|v| v.parse().ok()).collect();
-        if f.len() >= 9 {
-            rx = rx.saturating_add(f[0]);
-            tx = tx.saturating_add(f[8]);
-        }
+        IpAddr::V6(v6) => v6.segments()[0] & 0xe000 == 0x2000,
     }
-    (rx, tx)
+}
+
+/// Sums the kernel's lifetime byte counters of the counted interfaces, one
+/// count per byte on the wire.
+fn totals(counted: &[(&str, u64, u64)]) -> (u64, u64) {
+    counted.iter().fold((0, 0), |(rx, tx), (_, r, t)| (rx.saturating_add(*r), tx.saturating_add(*t)))
+}
+
+/// `(name, rx bytes, tx bytes)` for each interface in /proc/net/dev.
+fn net_dev(text: &str) -> impl Iterator<Item = (&str, u64, u64)> {
+    text.lines().skip(2).filter_map(|line| {
+        let (name, rest) = line.split_once(':')?;
+        let mut f = rest.split_whitespace().map(|v| v.parse::<u64>().ok());
+        let rx = f.next()??;
+        let tx = f.nth(7)??;
+        Some((name.trim(), rx, tx))
+    })
 }
 
 fn skip_iface(name: &str) -> bool {
     SKIP_IFACES.iter().any(|p| name.starts_with(p))
 }
 
-/// Stacked on top of another interface: bonds, bridges, VLAN children. The
-/// kernel books one packet on both, so counting these would double the traffic
-/// the hub bills.
+/// Stacked on top of another interface: bonds, bridges, VLAN children, and
+/// OpenWrt's `pppoe-wan` over its WAN port. The kernel books one packet on
+/// both, so counting these would double the traffic the hub bills. `pppoe-`
+/// names PPPoE alone: a bare `ppp0` may be an LTE modem's only link.
+///
+/// [`counted_elsewhere`] finds the same from the kernel's links under any name.
+/// The names still hold where sysfs cannot be read, and PPPoE has no such link
+/// to the port it runs over.
 ///
 /// A traffic rule only. These interfaces are where a host's own address most
-/// often sits -- `vmbr0` on Proxmox, `bond0` where two ports form one link --
-/// and whether bytes were already counted says nothing about address
-/// ownership.
+/// often sits -- `vmbr0` on Proxmox, `bond0` where two ports form one link,
+/// `pppoe-wan` on a router -- and whether bytes were already counted says
+/// nothing about address ownership.
 fn is_stacked(name: &str) -> bool {
-    name.contains('.') || ["bond", "br", "vlan", "vmbr"].iter().any(|p| name.starts_with(p))
+    name.contains('.') || ["bond", "br", "vlan", "vmbr", "pppoe-"].iter().any(|p| name.starts_with(p))
+}
+
+const SYS_NET: &str = "/sys/class/net";
+
+/// Link types of layer-3 tunnels as /sys/class/net/<name>/type prints them:
+/// none (tun, WireGuard, Tailscale), ipip, ip6tnl, sit, gre, ip6gre. Read off
+/// devices of each kind created on a 6.1 kernel. OpenVZ's `venet0`, a
+/// container's only link, is void (65535) and stays out.
+const TUNNEL_TYPES: &[&str] = &["65534", "768", "769", "776", "778", "823"];
+
+/// Layer-2 tunnels that name themselves in `uevent`. GRE taps set no DEVTYPE
+/// and are left to [`SKIP_IFACES`].
+const TUNNEL_DEVTYPES: &[&str] = &["DEVTYPE=vxlan", "DEVTYPE=geneve"];
+
+/// Devices that relay their ports' bytes and carry none of their own. Named in
+/// `uevent` whether or not a port is attached, unlike the `lower_*` link, so an
+/// LXD bridge whose last container has stopped stays out rather than joining
+/// the sum with its lifetime counter.
+const STACKED_DEVTYPES: &[&str] = &["DEVTYPE=bridge", "DEVTYPE=bond"];
+
+/// Whether the kernel shows this interface's bytes counted on another one,
+/// whatever it is called:
+///
+/// - a bridge or bond by DEVTYPE, or a `lower_*` link naming a device beneath
+///   it in this namespace: a VLAN, a macvlan, a DSA switch port over its
+///   conduit. The link is absent once a device moves to another namespace, so a
+///   container whose only link is a macvlan still counts it.
+/// - no hardware behind it, and a tunnel's link type or DEVTYPE: `he-ipv6`, a
+///   mesh VPN or a user-named vxlan is caught as surely as `wg0`, since its
+///   payload leaves again inside a packet the carrier counts. Hardware exempts
+///   an LTE modem in raw-IP mode, which shares type none with WireGuard.
+/// - no hardware behind it, and a bridge's port (`brport/`): a VM's tap such as
+///   libvirt's `vnet0`, or a container's veth. What the guest sends out crosses
+///   the physical port as well. A container's own only link is no bridge's port
+///   inside the container and stays counted, as does a device under another
+///   master -- a VRF, Open vSwitch -- whose uplink may be this very device.
+///
+/// A traffic rule only, like [`is_stacked`]: a tunnel broker's prefix on
+/// `he-ipv6` is this machine's address. Unreadable sysfs leaves the name rules
+/// alone in force.
+///
+/// ponytail: read afresh every sample, three or four sysfs calls for each
+/// interface the name rules leave standing. That is one or two NICs on most
+/// hosts; a hundred such interfaces would cost some 400 calls a second. Cache
+/// the answer per ifindex if a host like that turns up.
+fn counted_elsewhere(sys: &Path, name: &str) -> bool {
+    let dev = sys.join(name);
+    let read = |f: &str| fs::read_to_string(dev.join(f)).unwrap_or_default();
+    let uevent = read("uevent");
+    let devtype = |set: &[&str]| uevent.lines().any(|l| set.contains(&l));
+    // Before the hardware test: a DSA switch port has both.
+    let stacked = devtype(STACKED_DEVTYPES)
+        || fs::read_dir(&dev).is_ok_and(|mut entries| {
+            entries.any(|e| e.is_ok_and(|e| e.file_name().as_encoded_bytes().starts_with(b"lower_")))
+        });
+    if stacked {
+        return true;
+    }
+    if dev.join("device").exists() {
+        return false;
+    }
+    dev.join("brport").exists() || TUNNEL_TYPES.contains(&read("type").trim()) || devtype(TUNNEL_DEVTYPES)
 }
 
 /// A pseudo filesystem, named outright or as a flavour of one such as
@@ -403,14 +658,15 @@ fn parse_mounts(text: &str) -> Vec<String> {
     let mut seen = Vec::new();
     let mut out = Vec::new();
     let rows = mount_rows(text);
+    // The table is in mount order and a path resolves to the last mount on it,
+    // which is what statvfs below answers for. An earlier entry for the same
+    // point remains listed but is no longer reachable: under ProtectHome=yes a
+    // host whose /home is its own filesystem has that row sitting beneath a
+    // tmpfs, and counting it would book the tmpfs's size as /home's. Indexed
+    // once, as a Kubernetes node lists several mounts per pod.
+    let top: HashMap<&str, usize> = rows.iter().enumerate().map(|(i, &(_, mount, _))| (mount, i)).collect();
     for (i, &(dev, mount, fstype)) in rows.iter().enumerate() {
-        // The table is in mount order and a path resolves to the last mount on
-        // it, which is what statvfs below answers for. An earlier entry for the
-        // same point remains listed but is no longer reachable: under
-        // ProtectHome=yes a host whose /home is its own filesystem has that row
-        // sitting beneath a tmpfs, and counting it would book the tmpfs's size
-        // as /home's.
-        if rows[i + 1..].iter().any(|(_, m, _)| *m == mount) {
+        if top[mount] != i {
             continue;
         }
         if skip_fstype(fstype) {
@@ -524,47 +780,309 @@ fn cpuinfo() -> (String, u32) {
             let (k, v) = l.split_once(':')?;
             matches!(k.trim(), "model name" | "Model" | "cpu model").then(|| v.trim().to_owned())
         })
+        .or_else(|| arm_cpu_name(&text))
         .unwrap_or_else(|| "unknown".into());
     let cores = text.lines().filter(|l| l.starts_with("processor")).count().max(1) as u32;
     (name, cores)
 }
 
+/// AArch64 cores by MIDR implementer and part, under the names util-linux's
+/// `lscpu-arm.c` gives them. 32-bit Arm cores and the Cortex-M and Cortex-R
+/// microcontroller cores are left out.
+const ARM_CPUS: &[(u32, &str, Parts)] = &[
+    (
+        0x41,
+        "ARM",
+        &[
+            (0xd02, "Cortex-A34"),
+            (0xd03, "Cortex-A53"),
+            (0xd04, "Cortex-A35"),
+            (0xd05, "Cortex-A55"),
+            (0xd06, "Cortex-A65"),
+            (0xd07, "Cortex-A57"),
+            (0xd08, "Cortex-A72"),
+            (0xd09, "Cortex-A73"),
+            (0xd0a, "Cortex-A75"),
+            (0xd0b, "Cortex-A76"),
+            (0xd0c, "Neoverse-N1"),
+            (0xd0d, "Cortex-A77"),
+            (0xd0e, "Cortex-A76AE"),
+            (0xd40, "Neoverse-V1"),
+            (0xd41, "Cortex-A78"),
+            (0xd42, "Cortex-A78AE"),
+            (0xd43, "Cortex-A65AE"),
+            (0xd44, "Cortex-X1"),
+            (0xd46, "Cortex-A510"),
+            (0xd47, "Cortex-A710"),
+            (0xd48, "Cortex-X2"),
+            (0xd49, "Neoverse-N2"),
+            (0xd4a, "Neoverse-E1"),
+            (0xd4b, "Cortex-A78C"),
+            (0xd4c, "Cortex-X1C"),
+            (0xd4d, "Cortex-A715"),
+            (0xd4e, "Cortex-X3"),
+            (0xd4f, "Neoverse-V2"),
+            (0xd80, "Cortex-A520"),
+            (0xd81, "Cortex-A720"),
+            (0xd82, "Cortex-X4"),
+            (0xd83, "Neoverse-V3AE"),
+            (0xd84, "Neoverse-V3"),
+            (0xd85, "Cortex-X925"),
+            (0xd87, "Cortex-A725"),
+            (0xd88, "Cortex-A520AE"),
+            (0xd89, "Cortex-A720AE"),
+            (0xd8a, "C1-Nano"),
+            (0xd8b, "C1-Pro"),
+            (0xd8c, "C1-Ultra"),
+            (0xd8e, "Neoverse-N3"),
+            (0xd8f, "Cortex-A320"),
+            (0xd90, "C1-Premium"),
+        ],
+    ),
+    (0x42, "Broadcom", &[(0x100, "Brahma-B53"), (0x516, "ThunderX2")]),
+    (
+        0x43,
+        "Cavium",
+        &[
+            (0x0a0, "ThunderX"),
+            (0x0a1, "ThunderX-88XX"),
+            (0x0a2, "ThunderX-81XX"),
+            (0x0a3, "ThunderX-83XX"),
+            (0x0af, "ThunderX2-99xx"),
+            (0x0b0, "OcteonTX2"),
+            (0x0b1, "OcteonTX2-98XX"),
+            (0x0b2, "OcteonTX2-96XX"),
+            (0x0b3, "OcteonTX2-95XX"),
+            (0x0b4, "OcteonTX2-95XXN"),
+            (0x0b5, "OcteonTX2-95XXMM"),
+            (0x0b6, "OcteonTX2-95XXO"),
+            (0x0b8, "ThunderX3-T110"),
+        ],
+    ),
+    (0x46, "FUJITSU", &[(0x001, "A64FX"), (0x003, "MONAKA")]),
+    (
+        0x48,
+        "HiSilicon",
+        &[
+            (0xd01, "Kunpeng-920"),
+            (0xd02, "Kunpeng-920"),
+            (0xd03, "Kunpeng-920"),
+            (0xd06, "Kunpeng-950"),
+            (0xd22, "Kunpeng-920"),
+            (0xd40, "Cortex-A76"),
+            (0xd41, "Cortex-A77"),
+        ],
+    ),
+    (0x4e, "NVIDIA", &[(0x000, "Denver"), (0x003, "Denver-2"), (0x004, "Carmel"), (0x010, "Olympus")]),
+    (0x50, "APM", &[(0x000, "X-Gene")]),
+    (
+        0x51,
+        "Qualcomm",
+        &[
+            (0x001, "Oryon"),
+            (0x002, "Oryon-2"),
+            (0x201, "Kryo"),
+            (0x205, "Kryo"),
+            (0x211, "Kryo"),
+            (0x800, "Falkor-V1/Kryo"),
+            (0x801, "Kryo-V2"),
+            (0x802, "Kryo-3XX-Gold"),
+            (0x803, "Kryo-3XX-Silver"),
+            (0x804, "Kryo-4XX-Gold"),
+            (0x805, "Kryo-4XX-Silver"),
+            (0xc00, "Falkor"),
+            (0xc01, "Saphira"),
+        ],
+    ),
+    (
+        0x53,
+        "Samsung",
+        &[(0x001, "exynos-m1"), (0x002, "exynos-m3"), (0x003, "exynos-m4"), (0x004, "exynos-m5")],
+    ),
+    (
+        0x61,
+        "Apple",
+        &[
+            (0x022, "Icestorm-M1"),
+            (0x023, "Firestorm-M1"),
+            (0x024, "Icestorm-M1-Pro"),
+            (0x025, "Firestorm-M1-Pro"),
+            (0x028, "Icestorm-M1-Max"),
+            (0x029, "Firestorm-M1-Max"),
+            (0x032, "Blizzard-M2"),
+            (0x033, "Avalanche-M2"),
+            (0x034, "Blizzard-M2-Pro"),
+            (0x035, "Avalanche-M2-Pro"),
+            (0x038, "Blizzard-M2-Max"),
+            (0x039, "Avalanche-M2-Max"),
+        ],
+    ),
+    (0x6d, "Microsoft", &[(0xd49, "Azure-Cobalt-100")]),
+    (
+        0x70,
+        "Phytium",
+        &[
+            (0x303, "FTC310"),
+            (0x660, "FTC660"),
+            (0x661, "FTC661"),
+            (0x662, "FTC662"),
+            (0x663, "FTC663"),
+            (0x664, "FTC664"),
+            (0x862, "FTC862"),
+        ],
+    ),
+    (0xc0, "Ampere", &[(0xac3, "Ampere-1"), (0xac4, "Ampere-1a")]),
+];
+
+/// One implementer's parts, by MIDR part number.
+type Parts = &'static [(u32, &'static str)];
+
+/// The name of an AArch64 CPU, decoded as lscpu does it, since its /proc/cpuinfo
+/// carries no name, only each core's `CPU implementer` and `CPU part`. Every
+/// distinct core type is named once, in order, so a big.LITTLE chip reads as
+/// `Cortex-A55/Cortex-A76` rather than as its first cluster. The types are
+/// joined by `/`, not `+`: displays append ` × <cores>`, and
+/// `Cortex-A55 + Cortex-A76 × 8` reads as eight A76 cores. A part missing
+/// from [`ARM_CPUS`] takes its implementer's name; an unlisted implementer
+/// yields `None`.
+fn arm_cpu_name(text: &str) -> Option<String> {
+    let hex = |v: &str| u32::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok();
+    let mut vendor = None;
+    let mut names: Vec<&str> = Vec::new();
+    for (key, value) in text.lines().filter_map(|l| l.split_once(':')) {
+        match key.trim() {
+            "CPU implementer" => vendor = hex(value).and_then(|id| ARM_CPUS.iter().find(|(v, ..)| *v == id)),
+            "CPU part" => {
+                let Some((_, vendor, parts)) = vendor else { continue };
+                let part = hex(value);
+                let name = parts.iter().find(|(p, _)| Some(*p) == part).map_or(*vendor, |(_, n)| *n);
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+            _ => {}
+        }
+    }
+    (!names.is_empty()).then(|| names.join("/"))
+}
+
+/// os-release(5): /etc/os-release where it exists, /usr/lib/os-release
+/// otherwise. A value may be quoted either way.
 fn os_pretty_name() -> String {
-    fs::read_to_string("/etc/os-release")
-        .ok()
+    ["/etc/os-release", "/usr/lib/os-release"]
+        .into_iter()
+        .find_map(|path| fs::read_to_string(path).ok())
         .and_then(|t| {
-            t.lines().find_map(|l| Some(l.strip_prefix("PRETTY_NAME=")?.trim_matches('"').to_owned()))
+            t.lines().find_map(|l| Some(l.strip_prefix("PRETTY_NAME=")?.trim_matches(['"', '\'']).to_owned()))
         })
         .unwrap_or_else(|| "Linux".into())
 }
 
+/// The virtualization this system runs under, `none` on bare metal. A
+/// container is named rather than the machine whose kernel it shares.
 fn virtualization() -> String {
-    if fs::metadata("/proc/vz").is_ok() {
-        return "openvz".into();
+    let mounts = fs::read_to_string("/proc/self/mounts").unwrap_or_default();
+    container(Path::new("/"), &mounts)
+        .or_else(|| hypervisor().map(Into::into))
+        .unwrap_or_else(|| "none".into())
+}
+
+/// The container this system is, judged from what an unprivileged process
+/// can read: the agent runs as its own user, to whom PID 1's environment is
+/// closed.
+///
+/// - OpenVZ: /proc/vz without the /proc/bc that only the host has.
+/// - Whatever systemd, as PID 1 in a container, recorded in
+///   /run/systemd/container: `lxc`, `docker`, `podman`, `systemd-nspawn`.
+/// - The files Docker and Podman place in each container.
+/// - LXCFS mounted over /proc, as Proxmox and LXD give their containers. This
+///   covers an LXC guest booted by OpenRC, which records nothing; the host
+///   mounts LXCFS elsewhere.
+fn container(root: &Path, mounts: &str) -> Option<String> {
+    let has = |path: &str| root.join(path).exists();
+    if has("proc/vz") && !has("proc/bc") {
+        return Some("openvz".into());
     }
-    if fs::metadata("/proc/xen").is_ok() {
-        return "xen".into();
+    if let Some(name) = read_trim(root.join("run/systemd/container")).filter(|n| !n.is_empty()) {
+        return Some(name);
     }
-    if fs::metadata("/.dockerenv").is_ok() {
-        return "docker".into();
+    if has(".dockerenv") {
+        return Some("docker".into());
     }
-    if let Some(t) = read_trim("/sys/hypervisor/type") {
-        return t.to_lowercase();
+    if has("run/.containerenv") {
+        return Some("podman".into());
     }
-    for path in ["/sys/class/dmi/id/product_name", "/sys/class/dmi/id/sys_vendor"] {
-        let Some(v) = read_trim(path) else { continue };
-        let l = v.to_lowercase();
-        for k in ["kvm", "vmware", "virtualbox", "qemu", "hyper-v", "xen", "bochs", "amazon", "google"] {
-            if l.contains(k) {
-                return k.into();
-            }
-        }
+    mount_rows(mounts)
+        .iter()
+        .any(|&(_, mount, fstype)| fstype == "fuse.lxcfs" && mount.starts_with("/proc/"))
+        .then(|| "lxc".into())
+}
+
+/// The hypervisor beneath this system, `None` on bare metal. Xen is asked
+/// first: a PV guest has no CPUID signature, and an HVM guest that offers
+/// Windows the Hyper-V interface presents Microsoft's.
+fn hypervisor() -> Option<&'static str> {
+    if Path::new("/proc/xen").exists() || Path::new("/sys/hypervisor/type").exists() {
+        return Some("xen");
     }
-    if fs::read_to_string("/proc/cpuinfo").is_ok_and(|t| t.contains("hypervisor")) {
-        "vm".into()
-    } else {
-        "none".into()
+    platform_hypervisor()
+}
+
+/// An x86 hypervisor names itself in CPUID leaf 0x40000000, behind the
+/// hypervisor bit of leaf 1. A KVM guest reads `kvm` that way, or Microsoft's
+/// signature if it is offered the Hyper-V interface. Its DMI strings are the
+/// provider's to choose -- `KVM`, `QEMU`, `Bochs`, `Alibaba Cloud ECS` -- and
+/// would name one hypervisor several ways. A hypervisor that clears the bit
+/// leaves its guest reported as bare metal.
+#[cfg(target_arch = "x86_64")]
+fn platform_hypervisor() -> Option<&'static str> {
+    use std::arch::x86_64::__cpuid;
+    if __cpuid(1).ecx >> 31 == 0 {
+        return None;
     }
+    let leaf = __cpuid(0x4000_0000);
+    let mut signature = [0; 12];
+    for (bytes, reg) in signature.chunks_mut(4).zip([leaf.ebx, leaf.ecx, leaf.edx]) {
+        bytes.copy_from_slice(&reg.to_le_bytes());
+    }
+    Some(match &signature {
+        b"KVMKVMKVM\0\0\0" | b"Linux KVM Hv" => "kvm",
+        b"TCGTCGTCGTCG" => "qemu",
+        b"Microsoft Hv" => "hyper-v",
+        b"VMwareVMware" => "vmware",
+        b"VBoxVBoxVBox" => "virtualbox",
+        b"XenVMMXenVMM" => "xen",
+        b"bhyve bhyve " => "bhyve",
+        _ => "vm",
+    })
+}
+
+/// Without CPUID, QEMU's fw_cfg device marks a QEMU machine whatever its DMI
+/// strings say, and is reported as KVM: no provider runs aarch64 guests on the
+/// emulator alone. Clouds that run no QEMU name themselves in DMI, and each
+/// maps to its hypervisor: Nitro and Compute Engine are KVM, Azure is Hyper-V.
+///
+/// ponytail: a provider's bare-metal instance carries the same DMI vendor and
+/// reads as its hypervisor. Telling the two apart takes the SMBIOS
+/// virtual-machine bit, which only root can read.
+#[cfg(not(target_arch = "x86_64"))]
+fn platform_hypervisor() -> Option<&'static str> {
+    if Path::new("/sys/bus/acpi/devices/QEMU0002:00").exists() {
+        return Some("kvm");
+    }
+    let dmi = ["product_name", "sys_vendor"]
+        .map(|f| read_trim(format!("/sys/class/dmi/id/{f}")).unwrap_or_default().to_lowercase())
+        .join(" ");
+    [
+        ("kvm", "kvm"),
+        ("qemu", "kvm"),
+        ("amazon ec2", "kvm"),
+        ("google", "kvm"),
+        ("microsoft", "hyper-v"),
+        ("vmware", "vmware"),
+    ]
+    .into_iter()
+    .find_map(|(word, name)| dmi.contains(word).then_some(name))
 }
 
 #[cfg(test)]
@@ -620,7 +1138,7 @@ mod tests {
         // A counter that moved backwards indicates a reboot, not 100% busy.
         assert_eq!(busy_percent((1000, 925), (500, 400)), 0.0);
         // The first call has no baseline, so it reports 0.
-        assert_eq!(Collector::new().cpu_percent(), 0.0);
+        assert_eq!(Collector::default().cpu_percent(), 0.0);
     }
 
     #[test]
@@ -633,9 +1151,41 @@ mod tests {
         assert_eq!(parse_sockstat("", ""), (0, 0));
     }
 
+    /// An aarch64 /proc/cpuinfo names no model, so the name is looked up the way
+    /// lscpu does it. The part number is scoped by its implementer: HiSilicon
+    /// reuses ARM's 0xd40, which ARM assigns to Neoverse-V1.
+    #[test]
+    fn an_arm_cpu_is_named_from_its_implementer_and_part() {
+        let core = |implementer: u32, part: u32| {
+            format!("processor\t: 0\nCPU implementer\t: {implementer:#x}\nCPU part\t: {part:#x}\n")
+        };
+        // Oracle Cloud's Ampere Altra, as its guests see it.
+        let altra = "processor\t: 0\nBogoMIPS\t: 50.00\nFeatures\t: fp asimd evtstrm aes pmull sha1 sha2 crc32\n\
+                     CPU implementer\t: 0x41\nCPU architecture: 8\nCPU variant\t: 0x3\nCPU part\t: 0xd0c\nCPU revision\t: 1\n";
+        assert_eq!(arm_cpu_name(altra).as_deref(), Some("Neoverse-N1"));
+        assert_eq!(arm_cpu_name(&core(0x41, 0xd40)).as_deref(), Some("Neoverse-V1"));
+        assert_eq!(arm_cpu_name(&core(0x48, 0xd40)).as_deref(), Some("Cortex-A76"));
+        // RK3588: four little cores listed first, then four big ones.
+        let rk3588 = [core(0x41, 0xd05), core(0x41, 0xd05), core(0x41, 0xd0b), core(0x41, 0xd0b)].concat();
+        assert_eq!(arm_cpu_name(&rk3588).as_deref(), Some("Cortex-A55/Cortex-A76"));
+        // A core newer than the table still names its maker.
+        assert_eq!(arm_cpu_name(&core(0xc0, 0xac5)).as_deref(), Some("Ampere"));
+        assert_eq!(arm_cpu_name(&core(0x99, 0xd0c)), None, "an unknown implementer names nothing");
+        assert_eq!(arm_cpu_name("processor\t: 0\nmodel name\t: AMD EPYC 7763 64-Core Processor\n"), None);
+    }
+
+    /// Totals over constructed /proc/net/dev text, with no sysfs to consult.
+    fn sum(dev: &str, ifaces: &Ifaces) -> (u64, u64) {
+        totals(
+            &net_dev(dev).filter(|(n, ..)| ifaces.counts(Path::new("/nonexistent"), n)).collect::<Vec<_>>(),
+        )
+    }
+
     /// One byte on the wire, counted once. Every line but eth0 is that same
-    /// byte booked a second time: bond, bridge and VLAN are stacked over it,
-    /// and a tunnel's payload leaves inside a packet eth0 has already counted.
+    /// byte booked a second time: bond, bridge, VLAN and PPPoE are stacked over
+    /// it, a tunnel's payload leaves inside a packet eth0 has already counted,
+    /// `fwln` carries a Proxmox guest's traffic on its way to eth0, and `ifb`
+    /// mirrors eth0's ingress.
     ///
     /// `tailscale0` is listed because it is the same tunnel as `wg0` under a
     /// different name.
@@ -650,12 +1200,15 @@ mod tests {
            tailscale0: 300 1 0 0 0 0 0 0 400 2 0 0 0 0 0 0\n\
                  tun0: 300 1 0 0 0 0 0 0 400 2 0 0 0 0 0 0\n\
                  tap0: 300 1 0 0 0 0 0 0 400 2 0 0 0 0 0 0\n\
+            fwln100i0: 300 1 0 0 0 0 0 0 400 2 0 0 0 0 0 0\n\
+             ifb4eth0: 1000 1 0 0 0 0 0 0 1000 2 0 0 0 0 0 0\n\
                 bond0: 1000 1 0 0 0 0 0 0 2000 2 0 0 0 0 0 0\n\
                   br0: 1000 1 0 0 0 0 0 0 2000 2 0 0 0 0 0 0\n\
                 vmbr0: 1000 1 0 0 0 0 0 0 2000 2 0 0 0 0 0 0\n\
              eth0.100: 1000 1 0 0 0 0 0 0 2000 2 0 0 0 0 0 0\n\
-              vlan100: 1000 1 0 0 0 0 0 0 2000 2 0 0 0 0 0 0\n";
-        assert_eq!(parse_net_dev(dev), (1000, 2000));
+              vlan100: 1000 1 0 0 0 0 0 0 2000 2 0 0 0 0 0 0\n\
+            pppoe-wan: 1000 1 0 0 0 0 0 0 2000 2 0 0 0 0 0 0\n";
+        assert_eq!(sum(dev, &Ifaces::default()), (1000, 2000));
     }
 
     /// The two questions asked of an interface name, and why one list cannot
@@ -663,28 +1216,268 @@ mod tests {
     /// may be this machine's only address.
     #[test]
     fn a_stacked_device_loses_its_bytes_but_keeps_its_address() {
-        for name in ["bond0", "br0", "vmbr0", "eth0.100", "vlan100"] {
+        for name in ["bond0", "br0", "vmbr0", "eth0.100", "vlan100", "pppoe-wan"] {
             assert!(is_stacked(name), "{name}: the lower device already counted these bytes");
             assert!(!skip_iface(name), "{name} is where a host address lives");
         }
-        // Neither this machine's traffic nor its address: container networks,
-        // and tunnels whose payload leaves inside a packet eth0 has counted.
-        for name in ["lo", "docker0", "veth9a1b2c", "br-6cd9538131d7", "virbr0", "wg0", "tun0", "tap0"] {
+        // Not this machine's traffic: container networks, and tunnels whose
+        // payload leaves inside a packet eth0 has counted. Their addresses are
+        // lent only as [`lends_address`] allows.
+        for name in [
+            "lo",
+            "docker0",
+            "veth9a1b2c",
+            "br-6cd9538131d7",
+            "virbr0",
+            "wg0",
+            "tun0",
+            "tap0",
+            "fwln100i0",
+            "ifb4eth0",
+            "gretap0",
+            "erspan0",
+            "lxc9f2c1e",
+            "cilium_host",
+        ] {
             assert!(skip_iface(name), "{name} is not this machine");
         }
         assert!(!skip_iface("eth0") && !is_stacked("eth0"), "the wire itself is what gets counted");
     }
 
+    /// The kernel's account of an interface decides, whatever it is called.
+    /// Each entry mirrors what /sys/class/net held for that kind on a 6.1
+    /// kernel: link type, the `device` link of hardware, the `lower_` link of a
+    /// stacked device, DEVTYPE in `uevent`. A bridge is known by its DEVTYPE even
+    /// after its last port has gone and taken the `lower_` link with it. The
+    /// exempt ones are links a machine depends on that resemble a copy: a raw-IP
+    /// LTE modem shares WireGuard's type none, OpenVZ's venet0 has no device, a
+    /// macvlan moved into a container loses its `lower_` link there, a NIC in a
+    /// bridge is a bridge's port as a VM's tap is, and a VRF's member has a
+    /// master but is no bridge's port.
     #[test]
-    fn net_rate_is_zero_on_first_sample_and_after_a_reboot() {
-        let mut c = Collector::new();
+    fn the_kernel_tells_a_copy_whatever_the_interface_is_called() {
+        let sys = std::env::temp_dir().join(format!("monitor-agent-sys-{}", std::process::id()));
+        // Left behind by a failed run under a reused PID.
+        let _ = fs::remove_dir_all(&sys);
+        for (name, ty, extra) in [
+            ("he-ipv6", 776, &[][..]),
+            ("nebula1", 65534, &[]),
+            ("gre1", 778, &[]),
+            ("vx100", 1, &["DEVTYPE=vxlan"]),
+            ("lan", 1, &["lower_eth0"]),
+            ("lxdbr0", 1, &["DEVTYPE=bridge"]),
+            ("uplink", 1, &["DEVTYPE=bond"]),
+            ("wan", 1, &["device", "lower_eth0"]),
+            ("wwan0", 65534, &["device"]),
+            ("venet0", 65535, &[]),
+            ("mv0", 1, &[]),
+            ("eth0", 1, &["device"]),
+            ("vnet0", 1, &["brport"]),
+            ("eno1", 1, &["device", "brport"]),
+            ("up1", 1, &["master"]),
+        ] {
+            let dir = sys.join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("type"), format!("{ty}\n")).unwrap();
+            for e in extra {
+                match e.strip_prefix("DEVTYPE=") {
+                    Some(_) => fs::write(dir.join("uevent"), format!("{e}\nINTERFACE={name}\n")).unwrap(),
+                    None => fs::create_dir(dir.join(e)).unwrap(),
+                }
+            }
+        }
+        // Tunnels by link type and DEVTYPE; a user-named bridge and a DSA
+        // switch port by their link to the device beneath; a bridge with no
+        // port left and a bond by DEVTYPE; a VM's tap by its bridge.
+        for name in ["he-ipv6", "nebula1", "gre1", "vx100", "lan", "wan", "lxdbr0", "uplink", "vnet0"] {
+            assert!(counted_elsewhere(&sys, name), "{name}: another interface counts these bytes");
+        }
+        for name in ["wwan0", "venet0", "mv0", "eth0", "eno1", "up1", "absent0"] {
+            assert!(!counted_elsewhere(&sys, name), "{name} is this machine's own link");
+        }
+        fs::remove_dir_all(&sys).unwrap();
+    }
+
+    /// Each kind of container as an unprivileged process sees it. The host of
+    /// each kind shows part of the same picture -- /proc/vz beside /proc/bc,
+    /// LXCFS mounted outside /proc -- and is no container.
+    #[test]
+    fn a_container_is_named_from_what_an_unprivileged_process_can_read() {
+        let root = std::env::temp_dir().join(format!("monitor-agent-root-{}", std::process::id()));
+        let lxcfs = "lxcfs /proc/meminfo fuse.lxcfs rw,nosuid,nodev 0 0\n";
+        let lxcfs_host = "lxcfs /var/lib/lxcfs fuse.lxcfs rw,nosuid,nodev 0 0\n";
+        for (files, mounts, expected) in [
+            (&["proc/vz"][..], "", Some("openvz")),
+            (&["proc/vz", "proc/bc"], "", None),
+            (&["run/systemd/container=lxc\n"], "", Some("lxc")),
+            (&[".dockerenv"], "", Some("docker")),
+            (&["run/.containerenv"], "", Some("podman")),
+            (&[], lxcfs, Some("lxc")),
+            (&[], lxcfs_host, None),
+            (&[], "", None),
+        ] {
+            // Left behind by a failed run under a reused PID, or by the last case.
+            let _ = fs::remove_dir_all(&root);
+            for file in files {
+                let (path, content) = file.split_once('=').unwrap_or((file, ""));
+                fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+                fs::write(root.join(path), content).unwrap();
+            }
+            assert_eq!(container(&root, mounts).as_deref(), expected, "{files:?} {mounts:?}");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A router forwards each byte across two real NICs, so only its owner can
+    /// name the one facing the provider. A name in `--iface` is counted whatever
+    /// the built-in rules say; `-` entries come off the top of either.
+    #[test]
+    fn iface_names_what_is_counted_over_every_built_in_rule() {
+        // 1000 bytes downloaded through the router: in on the WAN port inside
+        // PPPoE, out through the LAN port. eth1.7 is a VLAN on the WAN port.
+        let dev = "header\nheader\n\
+                   eth0: 50 1 0 0 0 0 0 0 1000 2 0 0 0 0 0 0\n\
+                   eth1: 1008 1 0 0 0 0 0 0 60 2 0 0 0 0 0 0\n\
+                 eth1.7: 500 1 0 0 0 0 0 0 30 2 0 0 0 0 0 0\n\
+              pppoe-wan: 1000 1 0 0 0 0 0 0 52 2 0 0 0 0 0 0\n\
+                  vmbr0: 7 1 0 0 0 0 0 0 9 2 0 0 0 0 0 0\n";
+        let with = |spec: &str| sum(dev, &Ifaces::parse(spec).unwrap());
+        assert_eq!(with(""), (1058, 1060), "by default both real ports count the forwarded bytes");
+        assert_eq!(with("pppoe-wan"), (1000, 52), "a listed interface counts though it is stacked");
+        assert_eq!(with("vmbr0"), (7, 9));
+        assert_eq!(with("eth1.7"), (500, 30));
+        assert_eq!(with("-eth0"), (1008, 60), "an exclusion comes off the default set");
+        assert_eq!(with("eth0,eth1,-eth0"), (1008, 60), "an exclusion wins over a listing");
+        assert_eq!(with("eth9"), (0, 0), "an absent interface counts nothing rather than everything");
+
+        // Each would count nothing, everything, or not what it says.
+        for bad in ["eth0 eth1", "-", "eth0,-", "--eth0"] {
+            assert!(Ifaces::parse(bad).is_err(), "{bad:?} must be refused");
+        }
+    }
+
+    /// Any change to which interfaces are summed, within one boot, must make the
+    /// hub re-baseline rather than book the difference between two sums: a
+    /// device the rules reclassify, a changed `--iface`.
+    #[test]
+    fn the_epoch_changes_whenever_the_summed_set_does() {
+        let e = |names: &[&str]| epoch("boot", names.iter().copied());
+        assert!(e(&["eth0"]).starts_with("boot/"), "a reboot still changes it");
+        assert_ne!(e(&["eth0"]), e(&["eth0", "lxdbr0"]));
+        assert_ne!(e(&["eth0"]), e(&["eth1"]));
+        assert_ne!(e(&["eth0"]), e(&[]));
+        assert_eq!(e(&["eth1", "eth0"]), e(&["eth0", "eth1"]), "listing order is not a different set");
+    }
+
+    #[test]
+    fn the_reported_address_is_the_public_one_whatever_the_kernel_lists_first() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let picked = |held: &[&str], transient: &[Ipv6Addr]| {
+            let held: Vec<IpAddr> = held.iter().map(|s| ip(s)).collect();
+            pick(&held, transient)
+        };
+        let pair = |v4: &str, v6: &str| (v4.to_owned(), v6.to_owned());
+
+        // An LXC NAT guest: private v4 and a ULA on eth0, its public /128 on eth1.
+        assert_eq!(
+            picked(&["10.10.1.5", "fd42:43af:6613:5936::1", "2401:b60:1c::5"], &[]),
+            pair("10.10.1.5", "2401:b60:1c::5")
+        );
+        // A TUN-mode proxy, a CGNAT overlay and the LAN all listed before the
+        // public address.
+        assert_eq!(
+            picked(&["198.18.0.1", "100.64.0.9", "192.168.1.5", "203.0.113.7"], &[]),
+            pair("203.0.113.7", "")
+        );
+        // With nothing public the kernel's order stands.
+        assert_eq!(picked(&["192.168.1.5", "172.19.0.1"], &[]), pair("192.168.1.5", ""));
+
+        // SLAAC with privacy extensions lists the temporary address first.
+        let inet6 = "24098a1e3b4179f0a1b2c3d4e5f60718 02 40 00 01     eth0\n\
+                     24098a1e3b4179f00211223344556677 02 40 00 00     eth0\n\
+                     24098a1e3b4100000211223344556677 02 40 00 20     eth0\n\
+                     fe80000000000000021122fffe334455 02 40 20 80     eth0\n";
+        let transient = transient_v6(inet6);
+        let v6 = |s: &str| s.parse::<Ipv6Addr>().unwrap();
+        assert_eq!(
+            transient,
+            [v6("2409:8a1e:3b41:79f0:a1b2:c3d4:e5f6:718"), v6("2409:8a1e:3b41::211:2233:4455:6677")]
+        );
+        let slaac = [
+            "2409:8a1e:3b41:79f0:a1b2:c3d4:e5f6:718",
+            "2409:8a1e:3b41::211:2233:4455:6677",
+            "2409:8a1e:3b41:79f0:211:2233:4455:6677",
+        ];
+        assert_eq!(picked(&slaac, &transient), pair("", "2409:8a1e:3b41:79f0:211:2233:4455:6677"));
+        // A transient address is still better than none.
+        assert_eq!(picked(&slaac[..1], &transient), pair("", slaac[0]));
+    }
+
+    #[test]
+    fn a_wireguard_link_lends_only_a_public_v6() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert!(lends_address("wg0", ip("2001:db8::2")), "a routed prefix through the tunnel");
+        assert!(!lends_address("wg0", ip("203.0.113.9")), "only v6 is asked of a tunnel");
+        assert!(!lends_address("wg0", ip("10.0.0.2")), "a VPN's own address is not the machine's");
+        assert!(!lends_address("wg0", ip("fd00::2")));
+        assert!(!lends_address("wgcf", ip("2606:4700:110:8a36::1")), "WARP's shared address");
+        assert!(!lends_address("docker0", ip("2001:db8::1")), "a bridge's prefix belongs to its guests");
+        assert!(!lends_address("tailscale0", ip("2001:db8::2")));
+        assert!(lends_address("eth0", ip("2606:4700:110:8a36::1")), "the range is left out only on a tunnel");
+
+        // What `addresses` makes of a machine with a private v4 and a v6 only
+        // through WireGuard.
+        let held: Vec<IpAddr> = [("eth0", "10.0.0.2"), ("wg0", "10.9.0.2"), ("wg0", "2001:db8::2")]
+            .into_iter()
+            .filter(|(n, a)| lends_address(n, ip(a)))
+            .map(|(_, a)| ip(a))
+            .collect();
+        assert_eq!(pick(&held, &[]), ("10.0.0.2".to_owned(), "2001:db8::2".to_owned()));
+    }
+
+    #[test]
+    fn only_globally_routable_addresses_count_as_public() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        for s in [
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "100.64.0.1",
+            "100.127.255.1",
+            "127.0.0.1",
+            "169.254.1.1",
+            "0.0.0.1",
+            "192.0.0.4",
+            "198.18.0.1",
+            "198.19.255.1",
+            "224.0.0.1",
+            "fd42::1",
+            "fc00::1",
+            "fe80::1",
+            "::1",
+        ] {
+            assert!(!is_public(ip(s)), "{s}");
+        }
+        for s in
+            ["1.1.1.1", "100.128.0.1", "198.20.0.1", "192.0.1.1", "223.5.5.5", "2401:b60:1c::5", "3fff::1"]
+        {
+            assert!(is_public(ip(s)), "{s}");
+        }
+    }
+
+    #[test]
+    fn net_rate_counts_each_interface_against_its_own_last_reading() {
+        let mut c = Collector::default();
         let t0 = Instant::now();
-        assert_eq!(c.net_rate(1000, 2000, t0), (0, 0));
-        let t1 = t0 + std::time::Duration::from_secs(2);
-        assert_eq!(c.net_rate(1200, 2400, t1), (100, 200));
+        let at = |secs| t0 + std::time::Duration::from_secs(secs);
+        assert_eq!(c.net_rate(&[("eth0", 1000, 2000)], t0), (0, 0));
+        assert_eq!(c.net_rate(&[("eth0", 1200, 2400)], at(2)), (100, 200));
         // Counter restarted: no negative value, no spurious spike.
-        let t2 = t1 + std::time::Duration::from_secs(2);
-        assert_eq!(c.net_rate(50, 60, t2), (0, 0));
+        assert_eq!(c.net_rate(&[("eth0", 50, 60)], at(4)), (0, 0));
+        // An interface joined with its lifetime counter: not a burst of
+        // traffic, and the others keep their rate.
+        assert_eq!(c.net_rate(&[("eth0", 250, 460), ("eth1", 9_000_000, 9_000_000)], at(6)), (100, 200));
+        assert_eq!(c.net_rate(&[("eth0", 450, 860), ("eth1", 9_000_200, 9_000_400)], at(8)), (200, 400));
     }
 
     /// Two independent guards reject a mount: its filesystem type, and whether
@@ -700,6 +1493,7 @@ mod tests {
              none /mnt/scratch ext4 rw 0 0\n\
              /dev/vda1 /var/lib/bind ext4 rw 0 0\n\
              overlay /var/lib/docker/overlay2/x/merged overlay rw 0 0\n\
+             /home/.ecryptfs/u/.Private /home/u ecryptfs rw 0 0\n\
              /dev/vdb1 /data xfs rw 0 0\n\
              /mnt/disk1:/mnt/disk2 /pool fuse.mergerfs rw 0 0\n\
              //nas/backup /mnt/nas cifs rw 0 0\n\
@@ -714,7 +1508,10 @@ mod tests {
         // that pass for a device while holding either remote storage or a second
         // view of mounts already counted. Only the fstype list excludes those,
         // and only `fuse` as a whole covers the pool. A block device behind a
-        // fuse driver mounts as `fuseblk` and still counts.
+        // fuse driver mounts as `fuseblk` and still counts. The ecryptfs row is
+        // a fourth: a stacked mount whose source is a directory on the filesystem
+        // beneath it, so it passes the device check and carries a source of its
+        // own past the dedup, while statvfs reports that filesystem again.
         assert_eq!(mounts, vec!["/", "/data", "/tank"]);
     }
 
@@ -737,7 +1534,7 @@ mod tests {
 
     #[test]
     fn real_host_collection_is_sane() {
-        let mut c = Collector::new();
+        let mut c = Collector::default();
         let f = c.facts();
         assert!(!f.hostname.is_empty() && f.cpu_cores >= 1 && f.mem_total > 0);
         // Whatever this host reports must parse, and a virtual bridge must not
@@ -749,6 +1546,9 @@ mod tests {
         assert!(!f.ipv4.starts_with("172.17."), "a virtual bridge is not this machine's address");
         let m = c.collect();
         assert!(!m.boot_id.is_empty(), "boot_id drives reboot detection");
+        // Read through the real /sys: a link-type test misfiring on this host's
+        // NIC would leave nothing counted.
+        assert!(!c.counted_ifaces().is_empty(), "a reachable host counts at least one interface");
         assert!(m.mem_used > 0 && m.mem_used < m.mem_total);
         assert!(m.disk_used <= m.disk_total && m.disk_total > 0);
         assert!((0.0..=100.0).contains(&m.cpu));
@@ -773,7 +1573,7 @@ mod crosscheck {
     /// Values are printed, so `cargo test crosscheck -- --nocapture` shows them.
     #[test]
     fn memory_and_disk_agree_with_free_and_df_on_this_machine() {
-        let mut c = Collector::new();
+        let mut c = Collector::default();
         let m = c.collect();
         let gib = |b: u64| b as f64 / 1024.0 / 1024.0 / 1024.0;
         println!("mem  used={:.2}G total={:.2}G", gib(m.mem_used), gib(m.mem_total));
@@ -815,6 +1615,27 @@ mod crosscheck {
         let parse = |v: Option<&str>| v.expect("df column").parse::<u64>().expect("a byte count");
         assert_eq!(disk_total, parse(row.next()), "f_blocks is not df's size");
         close(disk_used, parse(row.next()), "disk");
+    }
+
+    /// The virtualization type against `systemd-detect-virt`, which reads the
+    /// same CPUID leaf and, as root, the container records this agent reads
+    /// unprivileged. It names four platforms by their vendor instead; its
+    /// `oracle` is VirtualBox, which would read as Oracle's cloud, a KVM one.
+    #[test]
+    fn virtualization_agrees_with_systemd_detect_virt() {
+        // Its exit status is 1 when the answer is `none`.
+        let out = std::process::Command::new("systemd-detect-virt")
+            .output()
+            .unwrap_or_else(|e| panic!("systemd-detect-virt(1) is what this is checked against: {e}"));
+        let theirs = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        let theirs = match theirs.as_str() {
+            "microsoft" => "hyper-v",
+            "oracle" => "virtualbox",
+            "amazon" | "google" => "kvm",
+            other => other,
+        };
+        println!("virt {}", virtualization());
+        assert_eq!(virtualization(), theirs);
     }
 
     /// A missing tool is a failure rather than grounds for passing quietly:

@@ -24,6 +24,7 @@ struct Args {
     server: String,
     token: String,
     interval: u64,
+    ifaces: collect::Ifaces,
     /// Permits plain HTTP to a hub reached at ip:port with no TLS in front.
     /// Off by default: the token would otherwise travel in the clear.
     insecure: bool,
@@ -37,8 +38,11 @@ fn usage() -> ! {
            --server <url>       Hub base URL, e.g. https://hub.example.com\n  \
            --token <token>      Node token from the hub panel\n  \
            --interval <secs>    Report interval (default 1)\n  \
-           --insecure           Allow plain ws:// to a remote hub; the token\n  \
-                                travels in the clear. Only for a hub reached\n  \
+           --iface <list>       Count traffic on these interfaces alone, e.g.\n                       \
+                                eth1,pppoe-wan. `-name` removes an interface\n                       \
+                                from what would be counted. Full names only.\n  \
+           --insecure           Allow plain ws:// to a remote hub; the token\n                       \
+                                travels in the clear. Only for a hub reached\n                       \
                                 at ip:port with no TLS in front.\n",
         env!("CARGO_PKG_VERSION")
     );
@@ -46,7 +50,7 @@ fn usage() -> ! {
 }
 
 fn parse_args() -> Result<Args> {
-    let (mut server, mut token, mut interval, mut insecure) = (None, None, 1u64, false);
+    let (mut server, mut token, mut interval, mut iface, mut insecure) = (None, None, 1u64, None, false);
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut value = || it.next().unwrap_or_else(|| usage());
@@ -54,6 +58,7 @@ fn parse_args() -> Result<Args> {
             "--server" => server = Some(value()),
             "--token" => token = Some(value()),
             "--interval" => interval = value().parse().unwrap_or_else(|_| usage()),
+            "--iface" => iface = Some(value()),
             "--insecure" => insecure = true,
             "-h" | "--help" => usage(),
             other => bail!("unknown argument: {other}"),
@@ -61,7 +66,9 @@ fn parse_args() -> Result<Args> {
     }
     let server = server.or_else(|| std::env::var("MONITOR_SERVER").ok()).unwrap_or_else(|| usage());
     let token = token.or_else(|| std::env::var("MONITOR_TOKEN").ok()).unwrap_or_else(|| usage());
-    Ok(Args { server, token, interval: interval.clamp(1, 3600), insecure })
+    let iface = iface.or_else(|| std::env::var("MONITOR_IFACE").ok()).unwrap_or_default();
+    let ifaces = collect::Ifaces::parse(&iface).map_err(anyhow::Error::msg)?;
+    Ok(Args { server, token, interval: interval.clamp(1, 3600), ifaces, insecure })
 }
 
 /// `https://host/path` -> `wss://host/path/api/agent/ws`. The token travels in
@@ -121,7 +128,7 @@ struct Rpc {
     params: serde_json::Value,
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Clone)]
 struct PingTask {
     id: i64,
     target: String,
@@ -178,7 +185,15 @@ async fn main() -> Result<()> {
     for mount in collect::shadowed_mounts(&std::fs::read_to_string("/proc/self/mounts").unwrap_or_default()) {
         eprintln!("{mount} is covered by another mount and is not counted toward disk totals");
     }
-    let mut collector = Collector::new();
+    let mut collector = Collector::new(args.ifaces);
+    // Reported once at startup: an interface summed twice otherwise shows only
+    // as a total twice the real one. One listed in --iface but absent here,
+    // such as a PPPoE link not yet dialled, is counted once it appears.
+    let counted = collector.counted_ifaces();
+    eprintln!(
+        "counting traffic on: {}",
+        if counted.is_empty() { "none".to_owned() } else { counted.join(" ") }
+    );
     let mut wait = 0u64;
 
     loop {
@@ -211,17 +226,30 @@ fn reconnect_wait(previous: u64, lasted: Duration) -> u64 {
     }
 }
 
-/// Deadline covering all three stages of establishing a connection.
+/// Deadline covering every stage of establishing a connection: resolution,
+/// the TCP handshake, the TLS exchange and the HTTP upgrade.
 ///
 /// Only the TCP handshake has a deadline of its own; the TLS exchange and the
 /// HTTP upgrade have none, so a peer that accepts and then goes silent would
-/// leave `connect_async` pending indefinitely, and the agent running without
+/// leave the handshake pending indefinitely, and the agent running without
 /// reporting or logging.
 ///
 /// Deliberately generous: a healthy connect takes a quarter of a second, the
 /// slowest measured sixty. This is not a latency budget but the point past
 /// which nothing is expected to arrive.
 const CONNECT_DEADLINE: Duration = Duration::from_secs(120);
+
+/// How long one of the hub's addresses may take to accept a TCP connection
+/// while another remains to be tried: the first SYN and its retransmits at one
+/// and three seconds. The last address has no limit of its own and is bounded
+/// by [`CONNECT_DEADLINE`] alone, so a hub with a single slow address is
+/// reached as before.
+///
+/// Without it a black-holed address -- typically an AAAA record over a v6
+/// route that leads nowhere -- holds the connect for the kernel's 127 seconds
+/// of SYN retries, beyond CONNECT_DEADLINE, and the address behind it is never
+/// tried.
+const DIAL_FALLBACK: Duration = Duration::from_secs(5);
 
 /// The hub sends one kind of message, a probe list a few hundred bytes long.
 /// Tungstenite's 64 MiB default would hand the peer this process's entire
@@ -247,28 +275,53 @@ async fn session(
     interval: u64,
     connected: &mut Option<Instant>,
 ) -> Result<()> {
-    let mut request = url.into_client_request()?;
-    request
-        .headers_mut()
-        .insert("authorization", format!("Bearer {token}").parse().context("token is not header-safe")?);
+    let request = authorized(url, token)?;
     let config =
         WebSocketConfig::default().max_message_size(Some(MAX_MESSAGE)).max_frame_size(Some(MAX_MESSAGE));
-    let connect = tokio_tungstenite::connect_async_with_config(request, Some(config), false);
-    let (mut ws, _) = tokio::time::timeout(CONNECT_DEADLINE, connect)
+    let uri = request.uri();
+    // Brackets off an IPv6 literal, which `lookup_host` parses bare.
+    let host = uri
+        .host()
+        .context("server URL has no host")?
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_owned();
+    let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("wss") { 443 } else { 80 });
+    // Collected before dialing, as the v4 it reports decides which family is
+    // tried first.
+    let facts = collector.facts();
+    let behind_nat = facts.ipv4.parse().is_ok_and(|ip| !collect::is_public(ip));
+    let connect = async {
+        let stream = dial(&host, port, behind_nat).await?;
+        let peer = stream.peer_addr()?;
+        let (ws, _) = tokio_tungstenite::client_async_tls_with_config(request, stream, Some(config), None)
+            .await
+            .context("handshake")?;
+        anyhow::Ok((ws, peer))
+    };
+    let (mut ws, peer) = tokio::time::timeout(CONNECT_DEADLINE, connect)
         .await
-        .with_context(|| format!("no connection after {}s", CONNECT_DEADLINE.as_secs()))?
-        .context("connect")?;
-    eprintln!("connected");
+        .with_context(|| format!("no connection after {}s", CONNECT_DEADLINE.as_secs()))??;
+    eprintln!("connected to {peer}");
     *connected = Some(Instant::now());
+    if let Some(v6) = glimpse_family(peer.is_ipv6(), &facts.ipv4, &facts.ipv6) {
+        tokio::spawn(glimpse(url.to_owned(), token.to_owned(), host.clone(), port, v6));
+    }
     // The clock starts at the handshake and the hello below draws from it like
     // every other write, so no two writes can each claim a full HUB_SILENCE.
     let mut last_frame = Instant::now();
 
-    send(&mut ws, notify("hello", serde_json::to_value(collector.facts())?), remaining(last_frame)).await?;
+    send(&mut ws, notify("hello", serde_json::to_value(facts)?), remaining(last_frame)).await?;
 
     let (result_tx, mut result_rx) = mpsc::channel::<Message>(64);
     let mut ping_tasks: Vec<(PingTask, tokio::task::JoinHandle<()>)> = Vec::new();
-    let mut ticker = tokio::time::interval(Duration::from_secs(interval));
+    // The baseline is taken a second before the first report, which then
+    // measures CPU and network over that second rather than over nothing --
+    // all a freshly started process has -- or over the outage since the
+    // previous session.
+    collector.collect();
+    let mut ticker =
+        tokio::time::interval_at(Instant::now() + Duration::from_secs(1), Duration::from_secs(interval));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let result = loop {
@@ -314,6 +367,138 @@ async fn session(
         handle.abort();
     }
     result
+}
+
+/// The upgrade request for `url`, carrying the node's token.
+fn authorized(url: &str, token: &str) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request> {
+    let mut request = url.into_client_request()?;
+    request
+        .headers_mut()
+        .insert("authorization", format!("Bearer {token}").parse().context("token is not header-safe")?);
+    Ok(request)
+}
+
+/// Which family a second connection is wanted in, as `v6`, given the one the
+/// session runs over and the addresses the interfaces hold. The session shows
+/// the hub one exit; for the other family it is wanted only where the interface
+/// holds a private address of it -- NAT66, a ULA behind a masquerading host --
+/// since a public one is reported as it is and none means nothing to connect
+/// from.
+fn glimpse_family(session_v6: bool, ipv4: &str, ipv6: &str) -> Option<bool> {
+    let held = if session_v6 { ipv4 } else { ipv6 };
+    held.parse::<std::net::IpAddr>().is_ok_and(|ip| !collect::is_public(ip)).then_some(!session_v6)
+}
+
+/// How long one attempt of [`glimpse`] may take. The session does not wait on
+/// it, so a path that cannot complete is abandoned well before
+/// [`CONNECT_DEADLINE`].
+const GLIMPSE_DEADLINE: Duration = Duration::from_secs(15);
+
+/// Attempts of [`glimpse`], and the wait between them. A session on a NAT66
+/// node can run for weeks, so one lost SYN or failed lookup would leave the hub
+/// without the exit until the next reconnect.
+const GLIMPSE_TRIES: u32 = 3;
+const GLIMPSE_RETRY: Duration = Duration::from_secs(30);
+
+/// How an attempt of [`glimpse`] ended once a connection was possible.
+enum Glimpse {
+    /// The hub took the connection, or has no address in that family.
+    Done,
+    /// The hub answered the handshake with a refusal: an older hub without the
+    /// route (404), or a proxy or firewall in front of it (403). Retrying
+    /// changes nothing.
+    Refused(u16),
+}
+
+/// The hub's echo route, from the session's URL.
+fn echo_url(session: &str) -> Result<String> {
+    let base = session.strip_suffix("/ws").context("server URL is not a session route")?;
+    Ok(format!("{base}/echo"))
+}
+
+/// Connects to the hub's echo route once over one address family, `v6` or v4,
+/// and drops the connection once it is upgraded. The hub learns the address this
+/// host exits at in that family from where the connection came, which an
+/// interface holding only a private address cannot tell it. Nothing is
+/// exchanged. Failures are logged and otherwise ignored: the session does not
+/// depend on this one.
+async fn glimpse(url: String, token: String, host: String, port: u16, v6: bool) {
+    let family = if v6 { "IPv6" } else { "IPv4" };
+    for attempt in 1..=GLIMPSE_TRIES {
+        match tokio::time::timeout(GLIMPSE_DEADLINE, echo_once(&url, &token, &host, port, v6)).await {
+            Ok(Ok(Glimpse::Done)) => return,
+            Ok(Ok(Glimpse::Refused(status))) => {
+                eprintln!("the hub answered {status} on its echo route over {family}; its exit there is not recorded");
+                return;
+            }
+            Ok(Err(e)) => eprintln!("the hub could not be reached over {family}: {e:#}"),
+            Err(_) => eprintln!("the hub could not be reached over {family}: no answer"),
+        }
+        if attempt < GLIMPSE_TRIES {
+            tokio::time::sleep(GLIMPSE_RETRY).await;
+        }
+    }
+}
+
+async fn echo_once(url: &str, token: &str, host: &str, port: u16, v6: bool) -> Result<Glimpse> {
+    let addrs: Vec<_> = tokio::net::lookup_host((host, port))
+        .await
+        .with_context(|| format!("resolve {host}"))?
+        .filter(|a| a.is_ipv6() == v6)
+        .collect();
+    if addrs.is_empty() {
+        return Ok(Glimpse::Done);
+    }
+    let stream = connect_first(&addrs).await?;
+    let request = authorized(&echo_url(url)?, token)?;
+    match tokio_tungstenite::client_async_tls_with_config(request, stream, None, None).await {
+        Ok(_) => Ok(Glimpse::Done),
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            Ok(Glimpse::Refused(response.status().as_u16()))
+        }
+        Err(e) => Err(anyhow::Error::new(e).context("handshake")),
+    }
+}
+
+/// Opens the TCP connection to the hub, trying its addresses in turn.
+///
+/// A host whose IPv4 is private tries the hub's IPv4 addresses first. Its
+/// public IPv4 exists only on the NAT in front of it, and the hub, which knows
+/// no more than the address a connection arrives from, learns it only from a
+/// connection made over v4. A public v6 needs no such route: it sits on the
+/// interface and travels in the hello. Every other host keeps the resolver's
+/// order.
+async fn dial(host: &str, port: u16, prefer_v4: bool) -> Result<TcpStream> {
+    let mut addrs: Vec<std::net::SocketAddr> =
+        tokio::net::lookup_host((host, port)).await.with_context(|| format!("resolve {host}"))?.collect();
+    if prefer_v4 {
+        addrs.sort_by_key(|a| !a.is_ipv4());
+    }
+    connect_first(&addrs).await.with_context(|| format!("connect {host}"))
+}
+
+/// The first of `addrs` to accept, each but the last given [`DIAL_FALLBACK`].
+/// Every failure is kept, so the log names which family failed and how.
+async fn connect_first(addrs: &[std::net::SocketAddr]) -> Result<TcpStream> {
+    let mut failures = Vec::new();
+    for (i, addr) in addrs.iter().enumerate() {
+        let attempt = TcpStream::connect(addr);
+        let result = if i + 1 < addrs.len() {
+            tokio::time::timeout(DIAL_FALLBACK, attempt)
+                .await
+                .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()))
+        } else {
+            attempt.await
+        };
+        match result {
+            Ok(stream) => return Ok(stream),
+            Err(e) => failures.push(format!("{addr}: {e}")),
+        }
+    }
+    if failures.is_empty() {
+        bail!("no address");
+    }
+    bail!("{}", failures.join("; "))
 }
 
 /// Ceiling on concurrent probe loops.
@@ -415,7 +600,8 @@ const MAX_PING_ADDRS: usize = 3;
 ///
 /// The name is resolved before the clock starts: `TcpStream::connect` on a
 /// hostname resolves first and connects second, which would fold resolver
-/// latency into every sample. glibc caches nothing, so this happens each round.
+/// latency into every sample. musl, which the release binaries link, keeps no
+/// cache, so this happens each round.
 ///
 /// ponytail: the `None` arm has no runtime reproduction; forcing it would
 /// require either a genuinely overrunning resolver or a test-only deadline
@@ -424,7 +610,7 @@ const MAX_PING_ADDRS: usize = 3;
 async fn tcp_ping(target: &str) -> Option<i32> {
     // Bounded by the handshake deadline: a resolution slower than a connect is
     // useless as a latency sample, and `lookup_host` has no deadline of its own
-    // -- glibc against a black-holed nameserver takes tens of seconds.
+    // -- musl waits five seconds on a black-holed nameserver.
     //
     // This does not cancel the underlying `getaddrinfo`, which runs to
     // completion on a blocking thread; it only keeps this probe on cadence.
@@ -442,9 +628,10 @@ async fn tcp_ping(target: &str) -> Option<i32> {
 /// The clock restarts on each address, so a dead one contributes nothing;
 /// summing them would report the accumulated wait as latency.
 ///
-/// Every failure advances to the next address, refusals included. glibc
-/// returns the v6 address first, and on a host whose v6 has no route stopping
-/// there would permanently report a target reachable over v4 as down.
+/// Every failure advances to the next address, refusals included. The
+/// resolver lists v6 first wherever the host has a v6 route, so stopping at
+/// the first failure would report a target reachable over v4 as down for as
+/// long as that route leads nowhere.
 async fn handshake(addresses: impl Iterator<Item = std::net::SocketAddr>) -> i32 {
     for address in addresses.take(MAX_PING_ADDRS) {
         let started = std::time::Instant::now();
@@ -478,6 +665,27 @@ mod tests {
         assert_eq!(reconnect_wait(60, Duration::from_secs(3600)), 1);
         // Connected but dropped too early to prove anything: still a retreat.
         assert_eq!(reconnect_wait(4, Duration::from_secs(29)), 8);
+    }
+
+    #[test]
+    fn a_second_connection_is_wanted_only_for_a_private_address_in_the_other_family() {
+        // A v4 session: NAT66 or a ULA is worth asking about, a public v6 is
+        // reported as it is, and none leaves nothing to connect from.
+        assert_eq!(glimpse_family(false, "10.0.0.5", "fd00::5"), Some(true));
+        assert_eq!(glimpse_family(false, "203.0.113.5", "fd42::1"), Some(true));
+        assert_eq!(glimpse_family(false, "10.0.0.5", "2001:db8::5"), None);
+        assert_eq!(glimpse_family(false, "10.0.0.5", ""), None);
+        // A v6 session reached over a hub that has no v4 record, or whose v4 failed.
+        assert_eq!(glimpse_family(true, "10.0.0.5", "2001:db8::5"), Some(false));
+        assert_eq!(glimpse_family(true, "203.0.113.5", "2001:db8::5"), None);
+        assert_eq!(glimpse_family(true, "", "2001:db8::5"), None);
+    }
+
+    #[test]
+    fn the_echo_route_sits_beside_the_session_route() {
+        let session = ws_url("https://hub.example.com/", false).unwrap();
+        assert_eq!(echo_url(&session).unwrap(), "wss://hub.example.com/api/agent/echo");
+        assert!(echo_url("wss://hub.example.com/other").is_err());
     }
 
     #[test]
@@ -547,6 +755,49 @@ mod tests {
             handshake([dead, dead, dead, addr].into_iter()).await,
             -1,
             "a fourth address is not tried"
+        );
+    }
+
+    /// A listener whose accept queue is full drops further SYNs rather than
+    /// refusing them: a black hole on loopback. The clock is paused, so the
+    /// fallback deadline elapses as soon as nothing else can progress, while
+    /// without it the connect would wait out the kernel's SYN retries.
+    #[tokio::test(start_paused = true)]
+    async fn a_black_holed_address_gives_way_to_the_next_within_the_fallback() {
+        let hole = tokio::net::TcpSocket::new_v4().unwrap();
+        hole.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let hole = hole.listen(0).unwrap();
+        let dead = hole.local_addr().unwrap();
+        let _queued = std::net::TcpStream::connect(dead).unwrap();
+        let live = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live = live.local_addr().unwrap();
+
+        let started = Instant::now();
+        let stream = connect_first(&[dead, live]).await.unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), live);
+        assert_eq!(started.elapsed(), DIAL_FALLBACK, "the dead address costs the fallback and no more");
+        let e = connect_first(&[dead, "127.0.0.1:1".parse().unwrap()]).await.unwrap_err().to_string();
+        assert!(e.contains("timed out") && e.contains("refused"), "each failure is named: {e}");
+    }
+
+    /// Where `localhost` resolves to ::1 before 127.0.0.1, only the preference
+    /// can land this connect on v4. Elsewhere -- no v6 loopback, or a resolver
+    /// ordering v4 first -- the preference is not observable and the test says
+    /// so rather than failing.
+    #[tokio::test]
+    async fn a_host_behind_nat_dials_the_hubs_v4_first() {
+        let v4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = v4.local_addr().unwrap().port();
+        let Ok(_v6) = std::net::TcpListener::bind(("::1", port)) else {
+            return eprintln!("skipped: no IPv6 loopback");
+        };
+        if !dial("localhost", port, false).await.unwrap().peer_addr().unwrap().is_ipv6() {
+            return eprintln!("skipped: the resolver lists 127.0.0.1 first");
+        }
+        assert!(dial("localhost", port, true).await.unwrap().peer_addr().unwrap().is_ipv4());
+        assert!(
+            dial("::1", port, true).await.unwrap().peer_addr().unwrap().is_ipv6(),
+            "a literal is dialed as given"
         );
     }
 
