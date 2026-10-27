@@ -18,7 +18,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
-use collect::Collector;
+use collect::{Collector, Facts};
 
 struct Args {
     server: String,
@@ -81,10 +81,13 @@ fn parse_args() -> Result<Args> {
 fn ws_url(server: &str, insecure: bool) -> Result<String> {
     let base = server.trim_end_matches('/');
     let scheme = if insecure { "ws" } else { "wss" };
-    let base = match base.split_once("://") {
-        Some(("https", rest)) => format!("wss://{rest}"),
-        Some(("http", rest)) => format!("ws://{rest}"),
-        Some(("wss" | "ws", _)) => base.to_owned(),
+    // Schemes are case-insensitive (RFC 3986), and a phone keyboard capitalises
+    // a hand-typed `Https://`; read as a bare host it would never resolve.
+    let (given, rest) = base.split_once("://").unwrap_or(("", base));
+    let base = match given.to_ascii_lowercase().as_str() {
+        "https" => format!("wss://{rest}"),
+        "http" => format!("ws://{rest}"),
+        ws @ ("wss" | "ws") => format!("{ws}://{rest}"),
         _ => format!("{scheme}://{base}"),
     };
     // RFC 3986 places userinfo before the host, so `127.0.0.1:28080@evil.example.com`
@@ -179,11 +182,25 @@ async fn main() -> Result<()> {
     let args = parse_args()?;
     let url = ws_url(&args.server, args.insecure)?;
     // Reported once at startup. install.sh hardens this unit with
-    // ProtectHome=yes, which mounts a tmpfs over /home; where /home is its own
-    // filesystem the totals then omit it. The unit file owns that decision, but
-    // the discrepancy must not go unreported.
-    for mount in collect::shadowed_mounts(&std::fs::read_to_string("/proc/self/mounts").unwrap_or_default()) {
-        eprintln!("{mount} is covered by another mount and is not counted toward disk totals");
+    // ProtectHome=yes and a user of its own, which keep some disks out of the
+    // totals. The unit file owns that decision, but the discrepancy must not go
+    // unreported. PID 1's table names every disk the sandbox hides; where /proc
+    // hides PID 1, this namespace's own table still shows a covered /home.
+    let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap_or_default();
+    match std::fs::read_to_string("/proc/1/mounts") {
+        Ok(host) => {
+            for mount in collect::hidden_mounts(&host, &mounts) {
+                eprintln!("{mount} is not visible to this service and is not counted toward disk totals");
+            }
+        }
+        Err(_) => {
+            for mount in collect::shadowed_mounts(&mounts) {
+                eprintln!("{mount} is covered by another mount and is not counted toward disk totals");
+            }
+        }
+    }
+    for (mount, e) in collect::unreadable_mounts(&mounts) {
+        eprintln!("{mount} cannot be read ({e}) and is not counted toward disk totals");
     }
     let mut collector = Collector::new(args.ifaces);
     // Reported once at startup: an interface summed twice otherwise shows only
@@ -267,6 +284,13 @@ const MAX_MESSAGE: usize = 64 * 1024;
 /// recovery at this constant rather than at tcp_retries2.
 const HUB_SILENCE: Duration = Duration::from_secs(90);
 
+/// How often a session collects its facts again; a change goes out as another
+/// hello. An address added while connected, or one that arrived after the
+/// boot-time hello, would otherwise wait for the next reconnect, weeks away on
+/// a steady link. The hub writes at most one hello per half of this and holds
+/// the latest of any that arrive sooner, so none needs sending twice.
+const FACTS_RECHECK: Duration = Duration::from_secs(60);
+
 /// One connection: handshake, then report until the socket closes.
 async fn session(
     url: &str,
@@ -289,7 +313,7 @@ async fn session(
     let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("wss") { 443 } else { 80 });
     // Collected before dialing, as the v4 it reports decides which family is
     // tried first.
-    let facts = collector.facts();
+    let mut facts = collector.facts();
     let behind_nat = facts.ipv4.parse().is_ok_and(|ip| !collect::is_public(ip));
     let connect = async {
         let stream = dial(&host, port, behind_nat).await?;
@@ -304,14 +328,21 @@ async fn session(
         .with_context(|| format!("no connection after {}s", CONNECT_DEADLINE.as_secs()))??;
     eprintln!("connected to {peer}");
     *connected = Some(Instant::now());
-    if let Some(v6) = glimpse_family(peer.is_ipv6(), &facts.ipv4, &facts.ipv6) {
-        tokio::spawn(glimpse(url.to_owned(), token.to_owned(), host.clone(), port, v6));
-    }
+    let glimpse_from = |facts: &Facts| {
+        if let Some(v6) = glimpse_family(peer.is_ipv6(), &facts.ipv4, &facts.ipv6) {
+            tokio::spawn(glimpse(url.to_owned(), token.to_owned(), host.clone(), port, v6));
+        }
+    };
+    glimpse_from(&facts);
     // The clock starts at the handshake and the hello below draws from it like
     // every other write, so no two writes can each claim a full HUB_SILENCE.
     let mut last_frame = Instant::now();
 
-    send(&mut ws, notify("hello", serde_json::to_value(facts)?), remaining(last_frame)).await?;
+    let mut hello = serde_json::to_value(&facts)?;
+    if let Some(fields) = hello.as_object_mut() {
+        fields.extend(collector.capacities().map(|(k, v)| (k.to_owned(), v.into())));
+    }
+    send(&mut ws, notify("hello", hello), remaining(last_frame)).await?;
 
     let (result_tx, mut result_rx) = mpsc::channel::<Message>(64);
     let mut ping_tasks: Vec<(PingTask, tokio::task::JoinHandle<()>)> = Vec::new();
@@ -323,12 +354,26 @@ async fn session(
     let mut ticker =
         tokio::time::interval_at(Instant::now() + Duration::from_secs(1), Duration::from_secs(interval));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut recheck = tokio::time::interval_at(Instant::now() + FACTS_RECHECK, FACTS_RECHECK);
+    recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let result = loop {
         tokio::select! {
             _ = ticker.tick() => {
                 let m = serde_json::to_value(collector.collect())?;
                 if let Err(e) = send(&mut ws, notify("report", m), remaining(last_frame)).await { break Err(e); }
+            }
+            _ = recheck.tick() => {
+                let fresh = collector.facts();
+                if fresh == facts {
+                    continue;
+                }
+                if (&fresh.ipv4, &fresh.ipv6) != (&facts.ipv4, &facts.ipv6) {
+                    glimpse_from(&fresh);
+                }
+                let hello = notify("hello", serde_json::to_value(&fresh)?);
+                if let Err(e) = send(&mut ws, hello, remaining(last_frame)).await { break Err(e); }
+                facts = fresh;
             }
             // Rebuilt each pass from the last frame, so silence costs exactly
             // HUB_SILENCE rather than a polling interval more. Kept separate
@@ -712,6 +757,11 @@ mod tests {
         assert!(ws_url("https://hub.example.com@evil.example.com/", false).is_err());
         // No token anywhere in the URL; it travels in a header.
         assert!(!ws_url("https://hub.example.com", false).unwrap().contains("token"));
+        // Already a WebSocket address, and any scheme in either case.
+        assert_eq!(ws_url("ws://127.0.0.1:1", false).unwrap(), "ws://127.0.0.1:1/api/agent/ws");
+        assert_eq!(ws_url("wss://hub.example.com", false).unwrap(), "wss://hub.example.com/api/agent/ws");
+        assert_eq!(ws_url("HTTPS://hub.example.com", false).unwrap(), "wss://hub.example.com/api/agent/ws");
+        assert!(ws_url("HTTP://hub.example.com", false).is_err(), "plaintext whatever its case");
     }
 
     /// `--insecure` covers a hub reached at ip:port with no TLS: it permits the
@@ -890,6 +940,13 @@ mod tests {
     }
 
     #[test]
+    fn the_token_travels_in_the_authorization_header_alone() {
+        let request = authorized("wss://hub.example.com/api/agent/ws", "s3cret").unwrap();
+        assert_eq!(request.headers()["authorization"], "Bearer s3cret");
+        assert!(!request.uri().to_string().contains("s3cret"));
+    }
+
+    #[test]
     fn ping_tasks_keep_their_timers_unless_the_task_changed() {
         // The runtime flavour the binary uses.
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -901,6 +958,7 @@ mod tests {
         respawn_ping_tasks(&mut running, vec![task(1, "a:1", 60), task(2, "b:2", 60)], &tx);
         assert_eq!(running.len(), 2);
         let (first, second) = (running[0].1.id(), running[1].1.id());
+        let replaced = running[1].1.abort_handle();
 
         // Task 1 unchanged, task 2 retargeted, task 3 added.
         respawn_ping_tasks(
@@ -913,6 +971,9 @@ mod tests {
         // A task whose target changed must be torn down, or it keeps probing
         // the old address.
         assert_ne!(running[1].1.id(), second, "a retargeted task must be restarted");
+        rt.block_on(async { tokio::time::sleep(Duration::from_millis(50)).await });
+        assert!(replaced.is_finished(), "the old one is stopped, not left probing beside it");
+        assert!(!running[0].1.is_finished(), "the unchanged one keeps running");
 
         // Interval 0 must not take the probe down: tokio's interval panics on
         // a zero period, and a panicked task stops reporting silently.
